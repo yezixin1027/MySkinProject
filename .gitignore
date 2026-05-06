@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.idea/
+
+# Training artifacts
+results/
+weights/
+learning_curve.png
+train_results.json
+
+# Local data
+data/
