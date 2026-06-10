@@ -189,7 +189,8 @@ class MyUNet(nn.Module):
 ### 添加新数据集
 
 ```python
-from src.data.registry import register_dataset
+from src.dataset.registry import register_dataset
+
 
 @register_dataset("MyDataset")
 class MyDataset(Dataset):

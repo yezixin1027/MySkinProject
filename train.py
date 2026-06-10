@@ -16,7 +16,7 @@ sys.path.insert(0, ROOT)
 
 from src.utils.config import ConfigLoader
 from src.models.registry import build_model, list_models
-from src.data.registry import build_dataset, list_datasets
+from src.dataset.registry import build_dataset, list_datasets
 from src.training.losses import build_loss, list_losses
 from src.training.trainer import Trainer, build_optimizer, build_scheduler
 

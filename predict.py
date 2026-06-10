@@ -19,7 +19,7 @@ sys.path.insert(0, ROOT)
 
 from src.utils.config import ConfigLoader
 from src.models.registry import build_model
-from src.data.registry import build_dataset
+from src.dataset.registry import build_dataset
 from src.training.metrics import SegmentationMetric
 
 
@@ -50,7 +50,7 @@ def main():
     if cfg:
         val_ds = build_dataset(cfg.cfg, split="all")
     else:
-        from src.data.isic_dataset import ISIC2018Dataset
+        from src.dataset.isic_dataset import ISIC2018Dataset
         val_ds = ISIC2018Dataset("./data/train/images", "./data/train/masks",
                                  is_train=False, use_augmentation=False)
 

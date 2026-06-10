@@ -31,8 +31,8 @@ dataset:
     img_size: [224, 224]
     val_split: 0.2            # 训练/验证划分比例
   paths:
-    train_images: "./data/train/images"
-    train_masks: "./data/train/masks"
+    train_images: "./dataset/train/images"
+    train_masks: "./dataset/train/masks"
   augmentation:
     enabled: true
     flip_prob: 0.5
