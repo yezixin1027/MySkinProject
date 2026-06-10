@@ -1,68 +1,238 @@
-# 基于 Res-CoordUNet 的 ISIC-2018 皮肤病灶分割系统
+# Res-CoordUNet: ISIC-2018 皮肤病灶语义分割
 
-> **项目状态**：训练中 / 实验阶段  
-> **核心架构**：Residual Learning + Coordinate Gated Attention + Hybrid Loss
-
----
-
-## 🛠️ 训练技巧与超参数 (Training Highlights)
-
-### 核心训练算法
-* **混合精度加速 (AMP)**：通过 `torch.amp` 自动切换精度。针对 **RTX 4050 (6GB)** 深度优化，显存占用降低约 40%，计算速度提升近 2 倍。
-* **带预热的余弦退火 (Warmup + Cosine Annealing)**：
-  - **Warmup Stage**: 前 5 个 Epoch 学习率由 $10^{-6}$ 线性增长至 $10^{-4}$，确保随机初始化后的梯度稳定性。
-  - **Annealing Stage**: 预热结束后进入余弦衰减模式，使模型平滑地滑向全局最优解。
-* **早停机制 (Early Stopping)**：设定 `Patience=10`，若连续 10 轮验证集指标未提升则自动停止训练，防止过拟合。
-* **混合损失函数 (Hybrid Loss)**：结合 **Dice Loss** 与 **Focal Loss**，有效缓解背景区域远大于病灶区域导致的样本极度不平衡问题。
----
-
-## 📑 目录
-1. [项目简介](#1-项目简介)
-2. [模型核心创新](#2-模型核心创新)
-3. [项目目录结构](#3-项目目录结构)
-4. [算法优势对比](#4-算法优势对比)
-5. [环境要求与运行](#5-环境要求与运行)
-6. [实验结果](#6-实验结果)
-
-## 🚀 1. 项目简介
-本项目旨在利用深度学习技术对 ISIC-2018（Task 1）挑战赛提供的皮肤镜图像进行自动化分割。针对皮肤病灶边缘模糊、毛发伪影严重及对比度低等痛点，本项目在经典 U-Net 基础上进行了深度改进，提出并实现了 **Res-CoordUNet** 模型。
+> **架构**: YAML 配置驱动 | 注册器模式 | 回调系统  
+> **模型**: Residual U-Net + Coordinate Gated Attention  
+> **框架**: PyTorch
 
 ---
 
-## 💡 2. 模型核心创新 (Core Innovations)
+## 架构概览
 
-### 2.1 残差学习模块 (Residual Learning)
-* **技术逻辑**：采用 **Residual Block** 替换传统卷积层。
-* **优势**：通过“快捷路径（Shortcut）”保护原始图像细节，有效防止深层网络的梯度消失，使模型对病灶边缘的捕捉更细腻，收敛速度明显优于传统卷积。
+本项目采用 **YAML 配置驱动的模块化架构**，将数据集、模型、训练器、可视化四大模块完全解耦。
 
-### 2.2 坐标门控注意力 (Coordinate Gated Attention, CGA)
-* **技术逻辑**：在跳跃连接（Skip Connection）处集成坐标感知与语义门控。
-* **优势**：
-    * **位置感知**：利用水平和垂直方向的平均池化，使模型具备感知病灶“经纬度”的能力。
-    * **噪声抑制**：通过深层特征作为门控信号，自动过滤皮肤纹理、折痕和毛发干扰，显著降低误报率。
+```
+config/default.yaml        ← 所有超参数一处管理，无需改代码
+       │
+       ▼
+src/
+├── models/                ← 模型注册器 → build_model(config)
+│   ├── registry.py           @register_model("ResCoordUNet")
+│   ├── blocks.py             ResidualBlock / Down / OutConv
+│   ├── attention.py          CoordGatedAttention (CGA)
+│   └── res_coord_unet.py     Up + ResCoordUNet
+├── data/                  ← 数据集注册器 → build_dataset(config, split)
+│   ├── registry.py           @register_dataset("ISIC2018")
+│   ├── preprocess.py         DullRazor + CLAHE + GrayWorld
+│   ├── augmentation.py       SegmentationAugmentation
+│   └── isic_dataset.py       ISIC2018Dataset + from_config()
+├── training/              ← 训练引擎 + 回调系统
+│   ├── losses.py             DiceLoss / FocalLoss / HybridLoss + LOSS_REGISTRY
+│   ├── metrics.py            Dice, IoU, Sensitivity, Specificity
+│   ├── trainer.py            Trainer (AMP, device, epoch loop)
+│   └── callbacks.py          EarlyStopping / Checkpoint / Viz / Log / LR
+└── utils/
+    ├── config.py             ConfigLoader (YAML → dict + 校验 + 点号访问)
+    └── visualizer.py         TrainingVisualizer
+```
 
-### 2.3 混合损失函数 (Hybrid Loss)
-* **技术逻辑**：结合 **Dice Loss**（关注区域重叠度）与 **Focal Loss**（关注难区分像素）。
-* **优势**：有效缓解了背景区域远大于病灶区域导致的样本极度不平衡问题，强制网络学习边缘细节。
+**入口脚本**（极简，~30 行）：
+
+```python
+# train.py
+cfg = ConfigLoader("./config/default.yaml")
+train_ds = build_dataset(cfg.cfg, split="train")
+val_ds   = build_dataset(cfg.cfg, split="val")
+model    = build_model(cfg.cfg)
+loss_fn  = build_loss(cfg.cfg)
+Trainer(model, train_loader, val_loader, loss_fn, optimizer, scheduler, cfg.cfg).train()
+```
 
 ---
 
-## 📂 3. 项目目录结构
-```text
+## 快速开始
+
+```bash
+# 1. 安装依赖
+pip install -r requirements.txt
+
+# 2. 训练（使用默认配置）
+python train.py
+
+# 3. 使用自定义配置
+python train.py --config config/your_experiment.yaml
+
+# 4. 推理 & 可视化
+python predict.py --weights ./weights/best_model.pth --num_samples 10
+```
+
+---
+
+## YAML 配置
+
+所有超参数集中在 `config/default.yaml`，支持配置继承和覆盖：
+
+```yaml
+experiment:
+  name: "res_coord_unet_isic2018"
+  seed: 42
+
+model:
+  name: "ResCoordUNet"          # 换模型只需改这一行
+  params:
+    in_channels: 3
+    num_classes: 1
+    bilinear: true
+    base_c: 64
+
+dataset:
+  name: "ISIC2018"              # 换数据集只需改这一行
+  params:
+    img_size: [224, 224]
+    val_split: 0.2              # 80/20 划分，扩大验证集
+  augmentation:
+    enabled: true
+    flip_prob: 0.5
+    rotate_prob: 0.5
+    rotate_deg: 15
+
+training:
+  batch_size: 12
+  epochs: 200
+  loss:
+    name: "HybridLoss"          # 换损失只需改这一行
+    params: {dice_weight: 0.6, focal_weight: 0.4}
+  optimizer:
+    name: "AdamW"
+    params: {lr: 0.0001, weight_decay: 0.0001}
+  scheduler:
+    name: "WarmupCosine"
+    params: {warmup_epochs: 5, min_lr: 0.000001}
+  callbacks:
+    early_stopping:  {enabled: true, monitor: "val_dice", patience: 20}
+    model_checkpoint: {enabled: true, save_dir: "./weights"}
+    visualization:    {enabled: true, save_path: "./learning_curve.png"}
+    logging:          {enabled: true, log_path: "./train_results.json"}
+```
+
+---
+
+## 模型核心创新
+
+### 残差学习 (ResidualBlock)
+
+双卷积路径 + 1×1 shortcut，保护梯度流动，加速收敛。
+
+### 坐标门控注意力 (CoordGatedAttention)
+
+| 分支 | 机制 | 作用 |
+|------|------|------|
+| 坐标感知 | H/W 方向池化 → 1×1 位置编码 → Sigmoid | 赋予模型"经纬度"位置感知 |
+| 语义门控 | 深层特征 → 上采样 → 1×1 → Sigmoid | 抑制皮肤纹理、毛发噪声 |
+
+最终输出 = `x ⊙ attention_coord ⊙ attention_gate`
+
+### 混合损失 (Dice + Focal)
+
+Dice Loss 关注区域重叠度，Focal Loss 聚焦困难边缘像素，有效缓解正负样本极度不平衡。
+
+---
+
+## 训练策略
+
+| 技术 | 说明 |
+|------|------|
+| AMP 混合精度 | RTX 4050 显存降低 ~40%，训练提速 ~2× |
+| Warmup + Cosine Annealing | 前 5 epoch 从 1e-6 升至 1e-4，之后余弦衰减 |
+| 早停 | patience=20，监控 val_dice |
+| 在线增强 | 随机翻转 / 旋转 / 亮度扰动，空间变换对 image-mask 同步 |
+
+---
+
+## 数据预处理流水线
+
+```
+原图 → DullRazor 去毛发 → 灰度世界校色 → CLAHE 对比度增强 → 模型输入
+```
+
+- **DullRazor**: 黑帽运算提取毛发 → 阈值二值化 → Telea Inpainting 修复
+- **GrayWorld**: 按通道均值比例修正 RGB，消除光照偏差
+- **CLAHE**: LAB 空间 L 通道自适应直方图均衡化 (clipLimit=2.0, tile=8×8)
+
+---
+
+## 实验结果 (48 Epoch, RTX 4050 6GB)
+
+| 指标 | 数值 |
+|------|------|
+| Dice | 0.854 |
+| IoU | 0.766 |
+| Sensitivity | 0.903 |
+| Specificity | 0.969 |
+
+---
+
+## 扩展指南
+
+### 添加新模型
+
+```python
+from src.models.registry import register_model
+
+@register_model("MyUNet")
+class MyUNet(nn.Module):
+    def __init__(self, in_channels=3, num_classes=1, **kwargs):
+        ...
+```
+
+然后在 YAML 中 `model.name: "MyUNet"` 即可使用。
+
+### 添加新数据集
+
+```python
+from src.data.registry import register_dataset
+
+@register_dataset("MyDataset")
+class MyDataset(Dataset):
+    @classmethod
+    def from_config(cls, config, split):
+        ...
+```
+
+### 添加自定义回调
+
+```python
+from src.training.callbacks import Callback
+
+class MyCallback(Callback):
+    def on_epoch_end(self, trainer, epoch, logs):
+        ...
+```
+
+---
+
+## 目录结构
+
+```
 MySkinProject/
-├── src/                   # 🧠 核心算法层
-│   ├── unet_parts.py      # 基础组件：升级为 ResidualBlock (残差块)
-│   ├── attention_gate.py  # 创新模块：Coordinate Gated Attention (坐标门控)
-│   └── build_model.py     # 组装类：构建完整的 Res-CoordUNet 架构
-├── data_utils/            # 📦 数据处理层
-│   ├── preprocess.py      # 预处理：DullRazor 去毛发、CLAHE 增强
-│   └── dataset.py         # 自定义 Dataset：支持实时数据增强
-├── train_utils/           # 🛠️ 训练辅助层
-│   ├── losses.py          # 混合损失：Dice + Focal Loss 实现
-│   ├── metrics.py         # 评估指标：Dice, IoU, Sensitivity 等
-│   └── distributed_utils.py # 训练通用工具函数
-├── weights/               # 💾 权重存档点：保存最优模型 (.pth)
-├── train.py               # 🚀 训练主脚本 (集成 AMP 加速、余弦退火、进度条)
-├── predict.py             # 🔍 结果预测与可视化脚本
-├── requirements.txt       # 📋 环境依赖清单
-└── README.md              # 📝 项目说明文档
+├── config/default.yaml        # YAML 配置
+├── src/                       # 核心代码
+│   ├── models/                # 模型层 + 注册器
+│   ├── data/                  # 数据层 + 注册器
+│   ├── training/              # 训练引擎 + 回调 + 损失 + 指标
+│   └── utils/                 # 配置加载 + 可视化
+├── data/                      # ISIC-2018 数据集
+│   ├── train/images/          # 2576 张训练图
+│   └── train/masks/           # 2596 个标注
+├── weights/                   # 模型权重
+├── train.py                   # 训练入口
+├── predict.py                 # 推理入口
+└── requirements.txt
+```
+
+---
+
+## 依赖
+
+- Python >= 3.10
+- PyTorch >= 2.0
+- torchvision, opencv-python, numpy, matplotlib, tqdm, scipy, scikit-image, pyyaml

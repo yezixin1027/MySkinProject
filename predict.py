@@ -1,73 +1,97 @@
+"""
+Res-CoordUNet 推理 & 可视化 — 使用注册器加载模型
+
+用法:
+    python predict.py                           # 使用默认配置和权重
+    python predict.py --config config/xxx.yaml  # 使用自定义配置
+"""
+
 import os
+import sys
+import argparse
 import torch
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from src.build_model import ResCoordUNet
-from data_utils.dataset import ISIC2018Dataset
-from train_utils.metrics import SegmentationMetric
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+
+from src.utils.config import ConfigLoader
+from src.models.registry import build_model
+from src.data.registry import build_dataset
+from src.training.metrics import SegmentationMetric
 
 
 def main():
-    # 1. 基础配置
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    weights_path = "./weights/best_model.pth"
-    save_dir = "./results/visual_comparison"
-    os.makedirs(save_dir, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Res-CoordUNet 推理")
+    parser.add_argument("--config", type=str, default="./config/default.yaml",
+                        help="YAML 配置文件路径")
+    parser.add_argument("--weights", type=str, default="./weights/best_model.pth",
+                        help="模型权重路径")
+    parser.add_argument("--num_samples", type=int, default=10,
+                        help="可视化样本数量")
+    parser.add_argument("--save_dir", type=str, default="./results/visual_comparison",
+                        help="结果保存目录")
+    args = parser.parse_args()
 
-    # 2. 加载模型与权重
-    model = ResCoordUNet(in_channels=3, num_classes=1).to(device)
-    model.load_state_dict(torch.load(weights_path, map_location=device))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    # 1. 加载配置 & 模型
+    cfg = ConfigLoader(args.config) if os.path.exists(args.config) else None
+
+    model = build_model(cfg.cfg) if cfg else ResCoordUNet()
+    model.load_state_dict(torch.load(args.weights, map_location=device))
+    model.to(device)
     model.eval()
 
-    # 3. 加载验证集 (这里用 val_ds 抽样展示)
-    val_ds = ISIC2018Dataset("./data/val/images", "./data/val/masks", is_train=False)
+    # 2. 加载数据
+    if cfg:
+        val_ds = build_dataset(cfg.cfg, split="all")
+    else:
+        from src.data.isic_dataset import ISIC2018Dataset
+        val_ds = ISIC2018Dataset("./data/train/images", "./data/train/masks",
+                                 is_train=False, use_augmentation=False)
+
     metric_tool = SegmentationMetric()
+    indices = np.random.choice(len(val_ds), min(args.num_samples, len(val_ds)), replace=False)
 
-    # 4. 随机抽取样本进行预测 (比如抽 10 张)
-    num_samples = 10
-    indices = np.random.choice(len(val_ds), num_samples, replace=False)
-
-    print(f"🖼️ 正在生成论文对比图，保存至: {save_dir}")
+    print(f"🖼️  正在生成对比图 → {args.save_dir}")
 
     for idx in indices:
         image_tensor, mask_tensor = val_ds[idx]
-        # image_tensor: [3, H, W], mask_tensor: [1, H, W]
 
-        # 模型推理
+        # 推理
         input_tensor = image_tensor.unsqueeze(0).to(device)
         with torch.no_grad():
             output = model(input_tensor)["out"]
             pred_mask = torch.sigmoid(output)
 
-        # 计算单张图的指标
         metrics = metric_tool.calculate_all(pred_mask, mask_tensor.to(device))
 
-        # 数据转换用于绘图
-        # 原图还原 (假设做了归一化，这里转回 0-255)
+        # 转为 numpy 用于绘图
         img_np = image_tensor.permute(1, 2, 0).cpu().numpy()
         img_np = (img_np * 255).astype(np.uint8)
-        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)  # 注意颜色通道
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
         gt_np = mask_tensor.squeeze().cpu().numpy()
         pred_np = (pred_mask.squeeze().cpu().numpy() > 0.5).astype(np.uint8)
 
-        # 生成 Overlay (半透明红色覆盖在病灶上)
+        # Overlay
         overlay = img_np.copy()
-        overlay[pred_np == 1] = [0, 0, 255]  # BGR 红色
-        combined_view = cv2.addWeighted(img_np, 0.7, overlay, 0.3, 0)
+        overlay[pred_np == 1] = [0, 0, 255]
+        combined = cv2.addWeighted(img_np, 0.7, overlay, 0.3, 0)
 
-        # 5. 使用 Matplotlib 拼图
+        # 拼图
         plt.figure(figsize=(16, 4))
-
-        display_list = [img_np, gt_np, pred_np, combined_view]
-        titles = ['Original Image', 'Ground Truth',
-                  f'Prediction\n(Dice:{metrics["Dice"]:.3f})',
-                  'Overlay Result']
+        display_list = [img_np, gt_np, pred_np, combined]
+        titles = ['Original', 'Ground Truth',
+                  f'Prediction\n(Dice:{metrics["Dice"]:.3f})', 'Overlay']
 
         for i in range(4):
             plt.subplot(1, 4, i + 1)
-            if i == 1 or i == 2:
+            if i in (1, 2):
                 plt.imshow(display_list[i], cmap='gray')
             else:
                 plt.imshow(cv2.cvtColor(display_list[i], cv2.COLOR_BGR2RGB))
@@ -75,10 +99,10 @@ def main():
             plt.axis('off')
 
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f"sample_{idx}.png"), dpi=200)
+        plt.savefig(os.path.join(args.save_dir, f"sample_{idx}.png"), dpi=200)
         plt.close()
 
-    print(f"✅ 可视化完成！快去查看 {save_dir} 里的对比图吧。")
+    print(f"✅ 可视化完成! 共 {len(indices)} 张对比图")
 
 
 if __name__ == "__main__":

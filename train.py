@@ -1,164 +1,81 @@
+"""
+Res-CoordUNet 训练入口 — 配置驱动，模块化解耦
+
+用法:
+    python train.py                          # 使用 config/default.yaml
+    python train.py --config config/xxx.yaml # 使用自定义配置
+"""
+
 import os
 import sys
-import json
-import time
-import math
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+import argparse
 
-# 环境适配：确保能找到自定义模块
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(current_dir)
+# 确保项目根目录在 path 中
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
 
-from src.build_model import ResCoordUNet
-from data_utils.dataset import ISIC2018Dataset
-from train_utils.losses import HybridLoss
-from train_utils.distributed_utils import evaluate
-from train_utils.metrics import SegmentationMetric
-from train_utils.image import TrainingVisualizer
+from src.utils.config import ConfigLoader
+from src.models.registry import build_model, list_models
+from src.data.registry import build_dataset, list_datasets
+from src.training.losses import build_loss, list_losses
+from src.training.trainer import Trainer, build_optimizer, build_scheduler
 
 
 def main():
-    # ---------------------------------------------------------
-    # 1. 硬件与超参数配置
-    # ---------------------------------------------------------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser(description="Res-CoordUNet 训练")
+    parser.add_argument("--config", type=str, default="./config/default.yaml",
+                        help="YAML 配置文件路径")
+    args = parser.parse_args()
 
-    batch_size = 12
-    epochs = 200
-    initial_lr = 1e-4
-    warmup_epochs = 5
-    patience = 20
+    # 1. 加载配置
+    cfg = ConfigLoader(args.config)
+    print(f"[Config] {args.config}")
+    print(f"   可用模型: {list_models()}")
+    print(f"   可用数据集: {list_datasets()}")
+    print(f"   可用损失函数: {list_losses()}")
 
-    # ---------------------------------------------------------
-    # 2. 数据流加载
-    # ---------------------------------------------------------
-    train_ds = ISIC2018Dataset("./data/train/images", "./data/train/masks", is_train=True)
-    val_ds = ISIC2018Dataset("./data/val/images", "./data/val/masks", is_train=False)
+    # 2. 构建数据管道
+    train_loader_cfg = cfg.cfg
+    batch_size = cfg.get("training.batch_size", 12)
+    num_workers = cfg.get("training.num_workers", 8)
+    use_cuda = torch_available()
 
+    train_ds = build_dataset(cfg.cfg, split="train")
+    val_ds = build_dataset(cfg.cfg, split="val")
+
+    from torch.utils.data import DataLoader
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=8, pin_memory=True)
+                              num_workers=num_workers, pin_memory=use_cuda)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
-                            num_workers=8, pin_memory=True)
+                            num_workers=num_workers, pin_memory=use_cuda)
 
-    # ---------------------------------------------------------
-    # 3. 初始化工具类
-    # ---------------------------------------------------------
-    model = ResCoordUNet(in_channels=3, num_classes=1).to(device)
-    criterion = HybridLoss(dice_weight=0.6, focal_weight=0.4)
-    optimizer = optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=1e-4)
+    # 3. 构建模型
+    model = build_model(cfg.cfg)
 
-    # 实例化指标计算器和绘图器
-    metric_tool = SegmentationMetric()
-    visualizer = TrainingVisualizer(save_path="./learning_curve.png")
+    # 4. 构建损失函数 + 优化器 + 调度器
+    loss_fn = build_loss(cfg.cfg)
+    optimizer = build_optimizer(model, cfg.cfg)
+    scheduler = build_scheduler(optimizer, cfg.cfg, cfg.get("training.epochs", 200))
 
-    # 定义带 Warmup 的学习率调度函数
-    def lr_lambda(current_epoch):
-        if current_epoch < warmup_epochs:
-            return float(current_epoch) / float(max(1, warmup_epochs))
-        progress = float(current_epoch - warmup_epochs) / float(max(1, epochs - warmup_epochs))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    # 5. 启动训练
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        config=cfg.cfg,
+    )
+    trainer.train()
 
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-    scaler = torch.amp.GradScaler('cuda')
 
-    # ---------------------------------------------------------
-    # 4. 训练监控变量
-    # ---------------------------------------------------------
-    best_dice = 0.0
-    early_stop_count = 0
-    train_logs = []
-    if not os.path.exists("./weights"): os.makedirs("./weights")
-
-    print(f"🔥 训练开启 | GPU: {torch.cuda.get_device_name(0)} | 样本数: {len(train_ds)}")
-
-    # ---------------------------------------------------------
-    # 5. 主循环
-    # ---------------------------------------------------------
-    for epoch in range(epochs):
-        # --- A. 训练阶段 ---
-        model.train()
-        accu_loss = 0.0
-        start_time = time.time()
-        current_lr = optimizer.param_groups[0]['lr']
-
-        train_bar = tqdm(train_loader, file=sys.stdout, colour='green')
-        train_bar.set_description(f"Epoch [{epoch + 1}/{epochs}]")
-
-        for i, (images, masks) in enumerate(train_bar):
-            images, masks = images.to(device), masks.to(device)
-            optimizer.zero_grad()
-
-            with torch.amp.autocast('cuda'):
-                outputs = model(images)["out"]
-                loss = criterion(outputs, masks)
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            accu_loss += loss.item()
-            train_bar.set_postfix({
-                "loss": f"{accu_loss / (i + 1):.4f}",
-                "lr": f"{current_lr:.2e}"
-            })
-
-        # --- B. 验证阶段 (全指标计算) ---
-        model.eval()
-        val_metrics = {"Dice": 0.0, "IoU": 0.0, "Sens": 0.0, "Spec": 0.0}
-
-        with torch.no_grad():
-            for v_images, v_masks in val_loader:
-                v_images, v_masks = v_images.to(device), v_masks.to(device)
-                v_outputs = model(v_images)["out"]
-
-                # 使用你的 SegmentationMetric 类计算 batch 指标
-                batch_res = metric_tool.calculate_all(v_outputs, v_masks)
-                for k in val_metrics.keys():
-                    val_metrics[k] += batch_res[k]
-
-        # 计算验证集平均值
-        num_val_batches = len(val_loader)
-        avg_metrics = {k: v / num_val_batches for k, v in val_metrics.items()}
-
-        scheduler.step()  # 更新下一轮学习率
-        epoch_time = time.time() - start_time
-        train_loss = accu_loss / len(train_loader)
-
-        # --- C. 日志记录与可视化 ---
-        log_entry = {
-            "epoch": epoch + 1,
-            "train_loss": round(train_loss, 4),
-            "val_dice": round(avg_metrics["Dice"], 4),
-            "val_iou": round(avg_metrics["IoU"], 4),
-            "val_sens": round(avg_metrics["Sens"], 4),
-            "val_spec": round(avg_metrics["Spec"], 4),
-            "lr": f"{current_lr:.8f}",
-            "time": f"{epoch_time:.1f}s"
-        }
-        train_logs.append(log_entry)
-
-        # 实时保存 JSON 并刷新 learning_curve.png
-        with open("train_results.json", "w") as f:
-            json.dump(train_logs, f, indent=4)
-        visualizer.draw(train_logs)
-
-        # --- D. 最佳模型保存与早停 ---
-        current_dice = avg_metrics["Dice"]
-        if current_dice > best_dice:
-            best_dice = current_dice
-            early_stop_count = 0
-            torch.save(model.state_dict(), "./weights/best_model.pth")
-            print(f"✨ 新纪录! Best Dice: {best_dice:.4f} (已同步刷新可视化看板)")
-        else:
-            early_stop_count += 1
-            if early_stop_count >= patience:
-                print(f"🛑 触发早停! 最终最高 Dice: {best_dice:.4f}")
-                break
-
-    print(f"🏁 训练圆满结束!")
+def torch_available():
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
 
 
 if __name__ == "__main__":
